@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -12,11 +14,12 @@ import requests
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.chain.transfer import TransferChain
-from app.core.config import settings
+from app.core.event import Event, eventmanager
 from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import FileItem, Response
+from app.schemas.types import EventType
 
 
 class QbApiError(RuntimeError):
@@ -32,14 +35,16 @@ class QbAutoOrganizer(_PluginBase):
         "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/"
         "main/icons/Qbittorrent_A.png"
     )
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "Codex"
     author_url = "https://github.com/jxxghp/MoviePilot"
     plugin_config_prefix = "qbautoorganizer_"
     plugin_order = 25
     auth_level = 1
 
-    _DATA_KEY = "processed_torrents"
+    _LEGACY_DATA_KEY = "processed_torrents"
+    _PROCESSED_FILE = "processed_hashes.json"
+    _RECORDS_FILE = "organize_records.json"
     _LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
     _DEFAULT_URL = "http://127.0.0.1:8080"
     _DEFAULT_USERNAME = "admin"
@@ -59,7 +64,16 @@ class QbAutoOrganizer(_PluginBase):
     def __init__(self):
         super().__init__()
         self._check_lock = threading.Lock()
+        self._data_lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._baseline_ready = False
+        self._known_hashes: Set[str] = set()
+        self._new_hashes: Set[str] = set()
+        self._submitted_hashes: Set[str] = set()
+        self._pending_sources: Dict[str, str] = {}
+        self._processed_hashes: Set[str] = set()
+        self._processed_path: Optional[Path] = None
+        self._records_path: Optional[Path] = None
 
     def init_plugin(self, config: dict = None):
         """Load settings. MoviePilot reloads public services after configuration changes."""
@@ -82,6 +96,12 @@ class QbAutoOrganizer(_PluginBase):
             else self._DEFAULT_LOG_LEVEL
         )
 
+        self._initialize_storage()
+        self._known_hashes.clear()
+        self._new_hashes.clear()
+        self._submitted_hashes.clear()
+        self._pending_sources.clear()
+        self._baseline_ready = False
         self._stop_event.clear()
         if self._enabled:
             filter_text = ", ".join(sorted(self._tag_filters)) or "全部"
@@ -90,6 +110,14 @@ class QbAutoOrganizer(_PluginBase):
                 f"插件已启用：服务器={self._qb_url}，轮询间隔={self._interval}秒，"
                 f"标签过滤={filter_text}",
             )
+            try:
+                self._capture_startup_baseline()
+            except Exception as exc:
+                self._log(
+                    "WARNING",
+                    "启动基线建立失败，将在首次连接成功时建立基线且不处理当时已存在的种子："
+                    f"{self._safe_error(exc)}",
+                )
 
     def get_state(self) -> bool:
         return self._enabled
@@ -104,9 +132,17 @@ class QbAutoOrganizer(_PluginBase):
                 "path": "/test",
                 "endpoint": self.test_connection,
                 "methods": ["GET"],
-                "auth": "apikey",
+                "auth": "bear",
                 "summary": "测试 qBittorrent 连接",
                 "description": "登录 qBittorrent Web API 并返回服务端版本。",
+            },
+            {
+                "path": "/records",
+                "endpoint": self.get_records,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取整理记录",
+                "description": "分页返回 qB 自动整理成功记录。",
             }
         ]
 
@@ -159,8 +195,28 @@ class QbAutoOrganizer(_PluginBase):
             self._log("ERROR", f"连接测试失败：{message}")
             return Response(success=False, message=f"连接失败：{message}")
 
+    def get_records(self, page: int = 1, page_size: int = 20) -> Response:
+        """Return persisted organize records to the Vue status page."""
+        page = max(1, int(page or 1))
+        page_size = min(100, max(1, int(page_size or 20)))
+        records = self._load_records()
+        total = len(records)
+        pages = max(1, math.ceil(total / page_size))
+        page = min(page, pages)
+        start = (page - 1) * page_size
+        return Response(
+            success=True,
+            data={
+                "records": records[start:start + page_size],
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "pages": pages,
+            },
+        )
+
     def check_completed_torrents(self) -> Dict[str, Any]:
-        """Poll qBittorrent once and enqueue eligible torrents in MoviePilot."""
+        """Discover torrents added after startup and organize them once complete."""
         if not self._enabled or self._stop_event.is_set():
             return {"checked": 0, "queued": 0, "failed": 0}
         if not self._check_lock.acquire(blocking=False):
@@ -169,13 +225,40 @@ class QbAutoOrganizer(_PluginBase):
 
         checked = queued = failed = 0
         try:
-            self._log("DEBUG", "开始查询 qBittorrent 已完成任务")
-            torrents = self._get_completed_torrents()
-            processed = self._load_processed()
+            self._log("DEBUG", "开始查询 qBittorrent 全部任务")
+            torrents = self._get_all_torrents()
+
+            if not self._baseline_ready:
+                self._set_baseline(torrents)
+                self._log(
+                    "INFO",
+                    f"已建立启动基线，共记录 {len(self._known_hashes)} 个历史种子；"
+                    "本轮不触发整理",
+                )
+                return {"checked": len(torrents), "queued": 0, "failed": 0}
+
+            current_hashes = {
+                str(item.get("hash") or "").strip().lower()
+                for item in torrents
+                if item.get("hash")
+            }
+            discovered = current_hashes - self._known_hashes
+            if discovered:
+                self._known_hashes.update(discovered)
+                self._new_hashes.update(discovered)
+                self._log("INFO", f"发现 {len(discovered)} 个启动后新增的种子")
+
+            removed = self._new_hashes - current_hashes
+            if removed:
+                self._new_hashes.difference_update(removed)
+                self._submitted_hashes.difference_update(removed)
+                for torrent_hash in removed:
+                    self._pending_sources.pop(torrent_hash, None)
+
             self._log(
                 "DEBUG",
-                f"qBittorrent 返回 {len(torrents)} 个已完成任务，"
-                f"持久化记录中已有 {len(processed)} 个 hash",
+                f"qBittorrent 返回 {len(torrents)} 个任务，启动后新增 "
+                f"{len(self._new_hashes)} 个，已成功整理 {len(self._processed_hashes)} 个",
             )
 
             for torrent in torrents:
@@ -190,11 +273,17 @@ class QbAutoOrganizer(_PluginBase):
                 checked += 1
 
                 name = str(torrent.get("name") or torrent_hash)
-                if torrent_hash in processed:
+                if torrent_hash not in self._new_hashes:
+                    self._log("DEBUG", f"启动前历史任务，跳过：{name} ({torrent_hash})")
+                    continue
+                if torrent_hash in self._processed_hashes:
                     self._log("DEBUG", f"任务已处理，跳过：{name} ({torrent_hash})")
                     continue
+                if torrent_hash in self._submitted_hashes:
+                    self._log("DEBUG", f"任务已提交整理，等待结果：{name} ({torrent_hash})")
+                    continue
                 if not self._is_completed(torrent):
-                    self._log("DEBUG", f"任务尚未完整下载，跳过：{name} ({torrent_hash})")
+                    self._log("DEBUG", f"新增任务尚未下载完成：{name} ({torrent_hash})")
                     continue
 
                 torrent_tags = self._parse_tags(torrent.get("tags"))
@@ -216,6 +305,8 @@ class QbAutoOrganizer(_PluginBase):
                     "INFO",
                     f"发现新的已完成任务：{name} ({torrent_hash})，路径={source_path}",
                 )
+                self._submitted_hashes.add(torrent_hash)
+                self._pending_sources[torrent_hash] = source_path
                 try:
                     success, detail = self._enqueue_transfer(
                         torrent=torrent,
@@ -226,6 +317,8 @@ class QbAutoOrganizer(_PluginBase):
                     success, detail = False, self._safe_error(exc)
 
                 if not success:
+                    self._submitted_hashes.discard(torrent_hash)
+                    self._pending_sources.pop(torrent_hash, None)
                     failed += 1
                     self._log(
                         "ERROR",
@@ -233,26 +326,10 @@ class QbAutoOrganizer(_PluginBase):
                     )
                     continue
 
-                processed[torrent_hash] = {
-                    "name": name,
-                    "path": source_path,
-                    "processed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-                }
-                try:
-                    self.save_data(self._DATA_KEY, processed)
-                except Exception as exc:
-                    failed += 1
-                    self._log(
-                        "ERROR",
-                        f"整理已入队但 hash 持久化失败：{name} ({torrent_hash}) - "
-                        f"{self._safe_error(exc)}",
-                    )
-                    continue
-
                 queued += 1
                 self._log(
                     "INFO",
-                    f"已加入 MoviePilot 整理队列并记录 hash：{name} ({torrent_hash})",
+                    f"已加入 MoviePilot 整理队列，等待成功事件：{name} ({torrent_hash})",
                 )
 
             self._log(
@@ -267,15 +344,32 @@ class QbAutoOrganizer(_PluginBase):
         finally:
             self._check_lock.release()
 
-    def _get_completed_torrents(self) -> List[dict]:
+    def _get_all_torrents(self) -> List[dict]:
         with self._qb_session() as session:
             response = session.get(
                 self._api_url("/api/v2/torrents/info"),
-                params={"filter": "completed"},
                 timeout=self._REQUEST_TIMEOUT,
             )
-            self._raise_for_status(response, "查询已完成任务")
+            self._raise_for_status(response, "查询种子任务")
             return self._decode_torrent_list(response)
+
+    def _capture_startup_baseline(self):
+        torrents = self._get_all_torrents()
+        self._set_baseline(torrents)
+        self._log(
+            "INFO",
+            f"启动基线建立完成：已记录 {len(self._known_hashes)} 个现有种子，"
+            "这些种子不会触发整理",
+        )
+
+    def _set_baseline(self, torrents: List[dict]):
+        self._known_hashes = {
+            str(item.get("hash") or "").strip().lower()
+            for item in torrents
+            if item.get("hash")
+        }
+        self._new_hashes.clear()
+        self._baseline_ready = True
 
     def _qb_session(self) -> requests.Session:
         self._validate_url()
@@ -340,6 +434,192 @@ class QbAutoOrganizer(_PluginBase):
         )
         return bool(state), str(message or "")
 
+    @eventmanager.register(EventType.TransferComplete)
+    def on_transfer_complete(self, event: Event):
+        """Persist a record only after MoviePilot reports a real transfer success."""
+        if not self._enabled or not event or not event.event_data:
+            return
+        event_data = event.event_data
+        torrent_hash = str(event_data.get("download_hash") or "").strip().lower()
+        if not torrent_hash or torrent_hash not in self._submitted_hashes:
+            return
+
+        try:
+            record = self._build_organize_record(torrent_hash, event_data)
+            with self._data_lock:
+                records = self._load_records_unlocked()
+                existing_index = next(
+                    (
+                        index
+                        for index, item in enumerate(records)
+                        if str(item.get("hash") or "").lower() == torrent_hash
+                    ),
+                    None,
+                )
+                if existing_index is None:
+                    records.insert(0, record)
+                else:
+                    records[existing_index] = record
+                self._write_json(self._records_path, records)
+
+                self._processed_hashes.add(torrent_hash)
+                self._write_json(
+                    self._processed_path, sorted(self._processed_hashes)
+                )
+
+            self._submitted_hashes.discard(torrent_hash)
+            self._new_hashes.discard(torrent_hash)
+            self._pending_sources.pop(torrent_hash, None)
+            self._log(
+                "INFO",
+                f"整理成功并写入记录：{record['media_name']} ({torrent_hash}) -> "
+                f"{record['target_path']}",
+            )
+        except Exception as exc:
+            self._log(
+                "ERROR",
+                f"写入整理成功记录失败：{torrent_hash} - {self._safe_error(exc)}",
+            )
+
+    @eventmanager.register(EventType.TransferFailed)
+    def on_transfer_failed(self, event: Event):
+        """Allow a failed submitted torrent to be retried on a later poll."""
+        if not event or not event.event_data:
+            return
+        torrent_hash = str(
+            event.event_data.get("download_hash") or ""
+        ).strip().lower()
+        if torrent_hash not in self._submitted_hashes:
+            return
+        self._submitted_hashes.discard(torrent_hash)
+        self._pending_sources.pop(torrent_hash, None)
+        self._log("WARNING", f"整理失败，后续轮询将重试：{torrent_hash}")
+
+    def _build_organize_record(
+        self, torrent_hash: str, event_data: dict
+    ) -> Dict[str, str]:
+        fileitem = event_data.get("fileitem")
+        mediainfo = event_data.get("mediainfo")
+        meta = event_data.get("meta")
+        transferinfo = event_data.get("transferinfo")
+
+        source_path = self._pending_sources.get(torrent_hash) or str(
+            getattr(fileitem, "path", "") or ""
+        )
+        target_path = ""
+        if transferinfo:
+            target_diritem = getattr(transferinfo, "target_diritem", None)
+            target_item = getattr(transferinfo, "target_item", None)
+            target_path = str(
+                getattr(target_diritem, "path", None)
+                or getattr(target_item, "path", None)
+                or ""
+            )
+            if not target_path:
+                target_files = getattr(transferinfo, "file_list_new", None) or []
+                target_path = str(target_files[0]) if target_files else ""
+
+        media_name = str(
+            getattr(mediainfo, "title", None)
+            or getattr(meta, "name", None)
+            or getattr(fileitem, "name", None)
+            or Path(source_path).name
+            or torrent_hash
+        )
+        media_type_value = getattr(mediainfo, "type", None)
+        media_type = str(
+            getattr(media_type_value, "value", media_type_value) or "未知"
+        )
+        if media_type not in {"电影", "电视剧"}:
+            media_type = "电视剧" if media_type.lower() in {"tv", "show"} else "电影"
+
+        poster_url = ""
+        poster_getter = getattr(mediainfo, "get_poster_image", None)
+        if callable(poster_getter):
+            try:
+                poster_url = str(poster_getter() or "")
+            except Exception:
+                poster_url = ""
+        if not poster_url:
+            poster_url = str(getattr(mediainfo, "poster_path", None) or "")
+
+        return {
+            "hash": torrent_hash,
+            "media_name": media_name,
+            "poster_url": poster_url,
+            "organized_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "source_path": source_path,
+            "target_path": target_path,
+            "media_type": media_type,
+        }
+
+    def _initialize_storage(self):
+        data_path = self.get_data_path()
+        data_path.mkdir(parents=True, exist_ok=True)
+        self._processed_path = data_path / self._PROCESSED_FILE
+        self._records_path = data_path / self._RECORDS_FILE
+
+        stored = self._read_json(self._processed_path, [])
+        if isinstance(stored, dict):
+            stored = list(stored)
+        self._processed_hashes = {
+            str(item).strip().lower() for item in stored if str(item).strip()
+        }
+
+        # Migrate dedup hashes written by v1.0.0 from MoviePilot's plugin DB.
+        try:
+            legacy = self.get_data(self._LEGACY_DATA_KEY)
+            legacy_hashes = list(legacy) if isinstance(legacy, (dict, list)) else []
+            before = len(self._processed_hashes)
+            self._processed_hashes.update(
+                str(item).strip().lower()
+                for item in legacy_hashes
+                if str(item).strip()
+            )
+            if len(self._processed_hashes) != before:
+                self._write_json(self._processed_path, sorted(self._processed_hashes))
+        except Exception as exc:
+            self._log("WARNING", f"迁移旧版 hash 数据失败：{self._safe_error(exc)}")
+
+        if not self._processed_path.exists():
+            self._write_json(self._processed_path, sorted(self._processed_hashes))
+        if not self._records_path.exists():
+            self._write_json(self._records_path, [])
+
+    def _load_records(self) -> List[dict]:
+        with self._data_lock:
+            return self._load_records_unlocked()
+
+    def _load_records_unlocked(self) -> List[dict]:
+        records = self._read_json(self._records_path, [])
+        if not isinstance(records, list):
+            return []
+        return sorted(
+            (item for item in records if isinstance(item, dict)),
+            key=lambda item: str(item.get("organized_at") or ""),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _read_json(path: Optional[Path], default: Any) -> Any:
+        if not path or not path.exists():
+            return default
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return default
+
+    @staticmethod
+    def _write_json(path: Optional[Path], value: Any):
+        if not path:
+            raise RuntimeError("插件数据路径尚未初始化")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_name(f"{path.name}.tmp")
+        temp_path.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temp_path.replace(path)
+
     def _resolve_downloader_source(self, torrent_hash: str) -> str:
         """Keep the original MoviePilot downloader instance when history exists."""
         try:
@@ -357,19 +637,6 @@ class QbAutoOrganizer(_PluginBase):
                 f"读取下载历史失败，将使用 qbittorrent 来源标记：{self._safe_error(exc)}",
             )
         return "qbittorrent"
-
-    def _load_processed(self) -> Dict[str, dict]:
-        try:
-            stored = self.get_data(self._DATA_KEY)
-        except Exception as exc:
-            self._log("ERROR", f"读取已处理 hash 失败：{self._safe_error(exc)}")
-            return {}
-
-        if isinstance(stored, dict):
-            return {str(key).lower(): value for key, value in stored.items()}
-        if isinstance(stored, list):
-            return {str(key).lower(): {} for key in stored}
-        return {}
 
     @staticmethod
     def _decode_torrent_list(response: requests.Response) -> List[dict]:
@@ -465,6 +732,11 @@ class QbAutoOrganizer(_PluginBase):
             logger.error(text)
         else:
             logger.info(text)
+
+    @staticmethod
+    def get_render_mode() -> Tuple[str, str]:
+        """Use MoviePilot's supported Vue module-federation renderer."""
+        return "vue", "dist/assets"
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """Return MoviePilot's declarative Vuetify configuration schema."""
@@ -564,7 +836,6 @@ class QbAutoOrganizer(_PluginBase):
                                             "click": {
                                                 "api": "plugin/QbAutoOrganizer/test",
                                                 "method": "get",
-                                                "params": {"apikey": settings.API_TOKEN},
                                             }
                                         },
                                     },
@@ -709,7 +980,8 @@ class QbAutoOrganizer(_PluginBase):
                                             "class": "mt-2",
                                             "text": (
                                                 "qBittorrent 返回的内容路径必须在 MoviePilot 容器内可见。"
-                                                "插件仅在整理成功入队后记录 hash，不会修改或删除种子。"
+                                                "插件启动时忽略全部现有种子，仅在收到整理成功事件后记录 hash，"
+                                                "且不会修改或删除种子。"
                                             ),
                                         },
                                     },
@@ -730,10 +1002,10 @@ class QbAutoOrganizer(_PluginBase):
         }
 
     @staticmethod
-    def get_page() -> Optional[List[dict]]:
-        return None
+    def get_page() -> List[dict]:
+        """The Vue renderer loads the exposed Page single-file component."""
+        return []
 
     def stop_service(self):
         """Ask an in-flight polling loop to stop at the next torrent boundary."""
         self._stop_event.set()
-
