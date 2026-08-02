@@ -7,6 +7,7 @@
 - 启动时记录全部现有 hash，历史种子即使之后完成也不会触发整理。
 - 以 10 秒以上的自定义间隔轮询 qBittorrent，持续跟踪启动后新增但尚未完成的种子。
 - 支持逗号分隔的 qB 标签过滤；命中任意一个配置标签即处理，留空处理全部。
+- 支持“强制整理”开关。关闭时跳过带“已整理”标签或已有整理记录的任务；开启时向整理链传递 `manual=True, force=True`。
 - 使用插件数据目录中的 `processed_hashes.json` 持久化成功整理的 hash。
 - 通过 `TransferChain.do_transfer()` 传入下载路径、`download_hash` 与下载器来源。若存在 MoviePilot 下载历史，则沿用其中的具体下载器实例名；否则使用 `qbittorrent`。
 - 监听 MoviePilot `TransferComplete` 事件，只有实际整理成功后才写入 `organize_records.json`。
@@ -38,7 +39,7 @@ qb-auto-organizer/
 
 1. 填写 qBittorrent Web UI 地址、用户名和密码，保存配置。
 2. 点击“立即检测”，确认弹窗显示连接成功。
-3. 设置监控间隔、可选标签和日志级别。
+3. 设置监控间隔、可选标签、强制整理开关和日志级别。
 4. 打开“启用插件”并保存。
 
 ## 路径映射要求

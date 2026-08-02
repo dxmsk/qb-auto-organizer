@@ -35,7 +35,7 @@ class QbAutoOrganizer(_PluginBase):
         "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/"
         "main/icons/Qbittorrent_A.png"
     )
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "Codex"
     author_url = "https://github.com/jxxghp/MoviePilot"
     plugin_config_prefix = "qbautoorganizer_"
@@ -59,6 +59,7 @@ class QbAutoOrganizer(_PluginBase):
     _interval: int = _DEFAULT_INTERVAL
     _tag_filter_text: str = ""
     _tag_filters: Set[str] = set()
+    _force_organize: bool = False
     _log_level: str = _DEFAULT_LOG_LEVEL
 
     def __init__(self):
@@ -87,6 +88,7 @@ class QbAutoOrganizer(_PluginBase):
         self._interval = self._normalize_interval(config.get("interval"))
         self._tag_filter_text = str(config.get("tag_filter") or "").strip()
         self._tag_filters = self._parse_tags(self._tag_filter_text)
+        self._force_organize = self._as_bool(config.get("force_organize", False))
         configured_level = str(
             config.get("log_level") or self._DEFAULT_LOG_LEVEL
         ).upper()
@@ -108,7 +110,7 @@ class QbAutoOrganizer(_PluginBase):
             self._log(
                 "INFO",
                 f"插件已启用：服务器={self._qb_url}，轮询间隔={self._interval}秒，"
-                f"标签过滤={filter_text}",
+                f"标签过滤={filter_text}，强制整理={'开启' if self._force_organize else '关闭'}",
             )
             try:
                 self._capture_startup_baseline()
@@ -294,6 +296,12 @@ class QbAutoOrganizer(_PluginBase):
                         f"{', '.join(sorted(torrent_tags)) or '无'}",
                     )
                     continue
+                if not self._force_organize and "已整理" in torrent_tags:
+                    self._log(
+                        "INFO",
+                        f"任务带有“已整理”标签，普通模式跳过：{name} ({torrent_hash})",
+                    )
+                    continue
 
                 source_path = self._torrent_content_path(torrent)
                 if not source_path:
@@ -430,6 +438,8 @@ class QbAutoOrganizer(_PluginBase):
             fileitem=fileitem,
             downloader=downloader,
             download_hash=torrent_hash,
+            manual=self._force_organize,
+            force=self._force_organize,
             background=True,
         )
         return bool(state), str(message or "")
@@ -892,7 +902,7 @@ class QbAutoOrganizer(_PluginBase):
                                             },
                                             {
                                                 "component": "VCol",
-                                                "props": {"cols": 12, "md": 8},
+                                                "props": {"cols": 12, "md": 4},
                                                 "content": [
                                                     {
                                                         "component": "VTextField",
@@ -904,6 +914,23 @@ class QbAutoOrganizer(_PluginBase):
                                                             "hint": "逗号分隔；命中任一标签即整理，留空则处理全部任务",
                                                             "persistent-hint": True,
                                                             "clearable": True,
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "force_organize",
+                                                            "label": "强制整理",
+                                                            "color": "warning",
+                                                            "inset": True,
+                                                            "hint": "开启后传递 manual=True、force=True，忽略“已整理”标签和历史整理记录",
+                                                            "persistent-hint": True,
                                                         },
                                                     }
                                                 ],
@@ -981,7 +1008,7 @@ class QbAutoOrganizer(_PluginBase):
                                             "text": (
                                                 "qBittorrent 返回的内容路径必须在 MoviePilot 容器内可见。"
                                                 "插件启动时忽略全部现有种子，仅在收到整理成功事件后记录 hash，"
-                                                "且不会修改或删除种子。"
+                                                "且不会修改或删除种子。强制整理只对启动后新增的种子生效。"
                                             ),
                                         },
                                     },
@@ -997,6 +1024,7 @@ class QbAutoOrganizer(_PluginBase):
             "password": "",
             "interval": self._DEFAULT_INTERVAL,
             "tag_filter": "",
+            "force_organize": False,
             "log_level": self._DEFAULT_LOG_LEVEL,
             "enabled": False,
         }

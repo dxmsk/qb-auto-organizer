@@ -9,7 +9,7 @@ const emit = defineEmits(['save', 'close'])
 
 const defaults = {
   qb_url: 'http://127.0.0.1:8080', username: 'admin', password: '', interval: 30,
-  tag_filter: '', log_level: 'INFO', enabled: false,
+  tag_filter: '', force_organize: false, log_level: 'INFO', enabled: false,
 }
 const config = ref({ ...defaults })
 const testing = ref(false)
@@ -73,7 +73,17 @@ onMounted(() => { config.value = { ...defaults, ...(props.initialConfig || {}) }
       <VCardText>
         <VRow>
           <VCol cols="12" md="4"><VTextField v-model.number="config.interval" label="监控间隔（秒）" type="number" min="10" hint="最小 10 秒" persistent-hint /></VCol>
-          <VCol cols="12" md="8"><VTextField v-model="config.tag_filter" label="标签过滤" placeholder="movie,tv" hint="逗号分隔，命中任一标签；留空处理全部" persistent-hint /></VCol>
+          <VCol cols="12" md="4"><VTextField v-model="config.tag_filter" label="标签过滤" placeholder="movie,tv" hint="逗号分隔，命中任一标签；留空处理全部" persistent-hint /></VCol>
+          <VCol cols="12" md="4">
+            <VSwitch
+              v-model="config.force_organize"
+              label="强制整理"
+              color="warning"
+              inset
+              hint="传递 manual=True、force=True，忽略“已整理”标签和历史整理记录"
+              persistent-hint
+            />
+          </VCol>
         </VRow>
       </VCardText>
     </VCard>
