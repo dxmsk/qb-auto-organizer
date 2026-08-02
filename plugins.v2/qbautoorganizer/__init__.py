@@ -36,7 +36,7 @@ class QbAutoOrganizer(_PluginBase):
         "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/"
         "main/icons/Qbittorrent_A.png"
     )
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "Codex"
     author_url = "https://github.com/jxxghp/MoviePilot"
     plugin_config_prefix = "qbautoorganizer_"
@@ -297,13 +297,16 @@ class QbAutoOrganizer(_PluginBase):
         except Exception as exc:
             self._log("DEBUG", f"读取秒传联动状态失败，继续整理：{torrent_hash[:12]} - {exc}")
             return "proceed"
-        if status in {"WATCHING", "WAITING", "PROCESSING", "RETRY_WAIT"}:
+        # WAITING/PROCESSING mean the first rapid-upload attempt has not
+        # completed. RETRY_WAIT is a recorded failure, so organizing may
+        # proceed while the rapid plugin keeps its configured retries alive.
+        if status in {"WATCHING", "WAITING", "PROCESSING"}:
             self._rapid_deferred_at.setdefault(torrent_hash, time.monotonic())
             self._log("INFO", f"秒传优先，暂缓整理：{name} ({torrent_hash[:12]})，状态={status}")
             return "defer"
         if status == "SUCCESS":
             self._rapid_uploaded_hashes.add(torrent_hash)
-            self._write_json(self._rapid_path, sorted(self._rapid_uploaded_hashes))
+            self._persist_rapid_hashes()
             self._rapid_deferred_at.pop(torrent_hash, None)
             self._log("INFO", f"115 秒传已成功，跳过 MoviePilot 整理：{name} ({torrent_hash[:12]})")
             return "skip"
@@ -314,6 +317,53 @@ class QbAutoOrganizer(_PluginBase):
                 return "defer"
         self._rapid_deferred_at.pop(torrent_hash, None)
         return "proceed"
+
+    def on_rapid_upload_success(self, download_hash: str) -> bool:
+        """Cancel this plugin's queued organizer state after a later retry wins."""
+        torrent_hash = str(download_hash or "").strip().lower()
+        if not torrent_hash:
+            return False
+        was_submitted = torrent_hash in self._submitted_hashes
+        source_path = self._pending_sources.get(torrent_hash, "")
+        self._submitted_hashes.discard(torrent_hash)
+        self._pending_sources.pop(torrent_hash, None)
+        self._rapid_deferred_at.pop(torrent_hash, None)
+        self._rapid_uploaded_hashes.add(torrent_hash)
+        self._persist_rapid_hashes()
+        if source_path:
+            try:
+                self._remove_transfer_queue(source_path)
+            except Exception as exc:
+                self._log("DEBUG", f"移除整理队列项目失败，将由秒传拦截器兜底：{exc}")
+        if was_submitted:
+            self._log("INFO", f"秒传重试成功，已取消自动整理队列：{torrent_hash[:12]}")
+        return was_submitted
+
+    @staticmethod
+    def _remove_transfer_queue(source_path: str) -> None:
+        path = Path(str(source_path))
+        is_file = path.is_file()
+        normalized = path.as_posix()
+        if not is_file and not normalized.endswith("/"):
+            normalized += "/"
+        try:
+            size = path.stat().st_size if is_file else 0
+        except OSError:
+            size = 0
+        fileitem = FileItem(
+            storage="local",
+            path=normalized,
+            type="file" if is_file else "dir",
+            name=path.name,
+            basename=path.stem,
+            extension=path.suffix.lstrip(".") if is_file else "",
+            size=size,
+        )
+        TransferChain().remove_from_queue(fileitem)
+
+    def _persist_rapid_hashes(self) -> None:
+        if self._rapid_path:
+            self._write_json(self._rapid_path, sorted(self._rapid_uploaded_hashes))
 
     def check_completed_torrents(self) -> Dict[str, Any]:
         """Discover torrents absent from the fixed baseline and organize them."""
@@ -382,9 +432,6 @@ class QbAutoOrganizer(_PluginBase):
                 if torrent_hash in self._rapid_uploaded_hashes:
                     self._log("DEBUG", f"任务已由 115 秒传处理，跳过整理：{name} ({torrent_hash})")
                     continue
-                if torrent_hash in self._submitted_hashes:
-                    self._log("DEBUG", f"任务已提交整理，等待结果：{name} ({torrent_hash})")
-                    continue
                 if not self._is_completed(torrent):
                     self._log("DEBUG", f"新增任务尚未下载完成：{name} ({torrent_hash})")
                     continue
@@ -414,6 +461,9 @@ class QbAutoOrganizer(_PluginBase):
                 if rapid_action == "defer":
                     continue
                 if rapid_action == "skip":
+                    continue
+                if torrent_hash in self._submitted_hashes:
+                    self._log("DEBUG", f"任务已提交整理，等待结果：{name} ({torrent_hash})")
                     continue
 
                 self._log(
@@ -1108,7 +1158,7 @@ class QbAutoOrganizer(_PluginBase):
                                                             "label": "115 秒传优先",
                                                             "color": "success",
                                                             "inset": True,
-                                                            "hint": "秒传处理中暂缓整理；秒传成功后跳过整理；失败或超时后恢复整理",
+                                                            "hint": "首次秒传未结束时暂缓整理；首次失败后允许整理；后续重试成功会取消已排队整理",
                                                             "persistent-hint": True,
                                                         },
                                                     }

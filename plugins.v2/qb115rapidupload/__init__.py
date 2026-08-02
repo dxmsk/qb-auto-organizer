@@ -19,7 +19,7 @@ class Qb115RapidUpload(_PluginBase):
     plugin_name = "qB 115 秒传"
     plugin_desc = "只处理 qBittorrent 新完成种子，按本地目录只读计算 SHA1 并秒传至 115"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/upload.png"
-    plugin_version = "0.4.0"
+    plugin_version = "0.4.1"
     plugin_author = "Codex"
     author_url = ""
     plugin_config_prefix = "qb115rapidupload_"
@@ -68,6 +68,7 @@ class Qb115RapidUpload(_PluginBase):
             client_getter=lambda: self._client,
             retry_minutes_getter=lambda: self._retry_interval_minutes,
             stop_requested=self._stop_event.is_set,
+            success_callback=self._notify_organizer_success,
         )
         if self._enabled and not self._cookie_115:
             logger.warning(f"{self.LOG_PREFIX} 插件已启用，但尚未配置 115 Cookie")
@@ -457,6 +458,21 @@ class Qb115RapidUpload(_PluginBase):
             "updated_at": task.get("updated_at"),
             "source_path": task.get("save_path") or task.get("content_path") or "",
         }
+
+    def _notify_organizer_success(self, download_hash: str) -> None:
+        """Tell a running organizer to remove a queued task immediately."""
+        try:
+            from app.core.plugin import PluginManager
+
+            plugins = getattr(PluginManager(), "running_plugins", {}) or {}
+            for plugin_id, plugin in plugins.items():
+                if not str(plugin_id).lower().startswith("qbautoorganizer"):
+                    continue
+                callback = getattr(plugin, "on_rapid_upload_success", None)
+                if callable(callback):
+                    callback(download_hash)
+        except Exception as exc:
+            logger.debug(f"{self.LOG_PREFIX} 自动整理联动通知不可用：{exc}")
 
     @eventmanager.register(EventType.DownloadAdded)
     def on_download_added(self, event: Event):

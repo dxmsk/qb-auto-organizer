@@ -12,11 +12,19 @@ LOG_PREFIX = "[qB 115 秒传]"
 
 
 class TaskCoordinator:
-    def __init__(self, repository, client_getter, retry_minutes_getter, stop_requested=None):
+    def __init__(
+        self,
+        repository,
+        client_getter,
+        retry_minutes_getter,
+        stop_requested=None,
+        success_callback=None,
+    ):
         self.repository = repository
         self.client_getter = client_getter
         self.retry_minutes_getter = retry_minutes_getter
         self.stop_requested = stop_requested or (lambda: False)
+        self.success_callback = success_callback or (lambda _download_hash: None)
         self._run_lock = threading.Lock()
 
     def process_due(self) -> int:
@@ -124,3 +132,7 @@ class TaskCoordinator:
 
         if self.repository.mark_success(task_id):
             logger.info(f"{LOG_PREFIX} 下载任务全部文件秒传成功：{task['download_hash'][:12]}")
+            try:
+                self.success_callback(task["download_hash"])
+            except Exception as exc:
+                logger.warning(f"{LOG_PREFIX} 通知自动整理插件取消队列失败：{exc}")

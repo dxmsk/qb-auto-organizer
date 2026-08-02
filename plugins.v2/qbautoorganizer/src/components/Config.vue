@@ -113,7 +113,7 @@ onMounted(() => { config.value = { ...defaults, ...(props.initialConfig || {}) }
               label="115 秒传优先"
               color="success"
               inset
-              hint="秒传处理中暂缓整理；秒传成功后跳过整理；失败或超时后恢复整理"
+              hint="首次秒传未结束时暂缓整理；首次失败后允许整理；后续重试成功会取消已排队整理"
               persistent-hint
             />
           </VCol>
