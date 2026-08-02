@@ -35,7 +35,7 @@ class QbAutoOrganizer(_PluginBase):
         "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/"
         "main/icons/Qbittorrent_A.png"
     )
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "Codex"
     author_url = "https://github.com/jxxghp/MoviePilot"
     plugin_config_prefix = "qbautoorganizer_"
@@ -43,8 +43,10 @@ class QbAutoOrganizer(_PluginBase):
     auth_level = 1
 
     _LEGACY_DATA_KEY = "processed_torrents"
+    _BASELINE_FILE = "baseline_hashes.json"
     _PROCESSED_FILE = "processed_hashes.json"
-    _RECORDS_FILE = "organize_records.json"
+    _RECORDS_FILE = "transfer_records.json"
+    _LEGACY_RECORDS_FILE = "organize_records.json"
     _LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
     _DEFAULT_URL = "http://127.0.0.1:8080"
     _DEFAULT_USERNAME = "admin"
@@ -73,6 +75,7 @@ class QbAutoOrganizer(_PluginBase):
         self._submitted_hashes: Set[str] = set()
         self._pending_sources: Dict[str, str] = {}
         self._processed_hashes: Set[str] = set()
+        self._baseline_path: Optional[Path] = None
         self._processed_path: Optional[Path] = None
         self._records_path: Optional[Path] = None
 
@@ -99,11 +102,9 @@ class QbAutoOrganizer(_PluginBase):
         )
 
         self._initialize_storage()
-        self._known_hashes.clear()
         self._new_hashes.clear()
         self._submitted_hashes.clear()
         self._pending_sources.clear()
-        self._baseline_ready = False
         self._stop_event.clear()
         if self._enabled:
             filter_text = ", ".join(sorted(self._tag_filters)) or "全部"
@@ -112,14 +113,21 @@ class QbAutoOrganizer(_PluginBase):
                 f"插件已启用：服务器={self._qb_url}，轮询间隔={self._interval}秒，"
                 f"标签过滤={filter_text}，强制整理={'开启' if self._force_organize else '关闭'}",
             )
-            try:
-                self._capture_startup_baseline()
-            except Exception as exc:
+            if self._baseline_ready:
                 self._log(
-                    "WARNING",
-                    "启动基线建立失败，将在首次连接成功时建立基线且不处理当时已存在的种子："
-                    f"{self._safe_error(exc)}",
+                    "INFO",
+                    f"已从 baseline_hashes.json 加载固定基线，共 "
+                    f"{len(self._known_hashes)} 个历史种子",
                 )
+            else:
+                try:
+                    self._capture_startup_baseline()
+                except Exception as exc:
+                    self._log(
+                        "WARNING",
+                        "首次基线建立失败，将在首次连接成功时建立基线且不处理当时已存在的种子："
+                        f"{self._safe_error(exc)}",
+                    )
 
     def get_state(self) -> bool:
         return self._enabled
@@ -145,7 +153,15 @@ class QbAutoOrganizer(_PluginBase):
                 "auth": "bear",
                 "summary": "获取整理记录",
                 "description": "分页返回 qB 自动整理成功记录。",
-            }
+            },
+            {
+                "path": "/baseline/reset",
+                "endpoint": self.reset_baseline,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "重置 qB 种子基线",
+                "description": "删除持久化基线，并在下次插件启动或重载时重新建立。",
+            },
         ]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -217,8 +233,27 @@ class QbAutoOrganizer(_PluginBase):
             },
         )
 
+    def reset_baseline(self) -> Response:
+        """Delete the persisted baseline without changing this running instance."""
+        try:
+            with self._data_lock:
+                if self._baseline_path and self._baseline_path.exists():
+                    self._baseline_path.unlink()
+            self._log(
+                "WARNING",
+                "固定基线已重置；当前运行期仍沿用内存基线，下次插件启动或配置重载时重新扫描",
+            )
+            return Response(
+                success=True,
+                message="基线已重置，下次插件启动或配置重载时将重新扫描现有种子",
+            )
+        except Exception as exc:
+            message = self._safe_error(exc)
+            self._log("ERROR", f"重置固定基线失败：{message}")
+            return Response(success=False, message=f"重置基线失败：{message}")
+
     def check_completed_torrents(self) -> Dict[str, Any]:
-        """Discover torrents added after startup and organize them once complete."""
+        """Discover torrents absent from the fixed baseline and organize them."""
         if not self._enabled or self._stop_event.is_set():
             return {"checked": 0, "queued": 0, "failed": 0}
         if not self._check_lock.acquire(blocking=False):
@@ -245,10 +280,10 @@ class QbAutoOrganizer(_PluginBase):
                 if item.get("hash")
             }
             discovered = current_hashes - self._known_hashes
-            if discovered:
-                self._known_hashes.update(discovered)
-                self._new_hashes.update(discovered)
-                self._log("INFO", f"发现 {len(discovered)} 个启动后新增的种子")
+            newly_observed = discovered - self._new_hashes
+            self._new_hashes.update(discovered)
+            if newly_observed:
+                self._log("INFO", f"发现 {len(newly_observed)} 个固定基线外的新种子")
 
             removed = self._new_hashes - current_hashes
             if removed:
@@ -377,6 +412,7 @@ class QbAutoOrganizer(_PluginBase):
             if item.get("hash")
         }
         self._new_hashes.clear()
+        self._write_json(self._baseline_path, sorted(self._known_hashes))
         self._baseline_ready = True
 
     def _qb_session(self) -> requests.Session:
@@ -566,8 +602,26 @@ class QbAutoOrganizer(_PluginBase):
     def _initialize_storage(self):
         data_path = self.get_data_path()
         data_path.mkdir(parents=True, exist_ok=True)
+        self._baseline_path = data_path / self._BASELINE_FILE
         self._processed_path = data_path / self._PROCESSED_FILE
         self._records_path = data_path / self._RECORDS_FILE
+
+        baseline = self._read_json(self._baseline_path, None)
+        if isinstance(baseline, (list, dict)):
+            self._known_hashes = {
+                str(item).strip().lower()
+                for item in baseline
+                if str(item).strip()
+            }
+            self._baseline_ready = True
+        else:
+            if self._baseline_path.exists():
+                self._log(
+                    "WARNING",
+                    "baseline_hashes.json 内容无效，将在连接 qBittorrent 成功后重新建立固定基线",
+                )
+            self._known_hashes = set()
+            self._baseline_ready = False
 
         stored = self._read_json(self._processed_path, [])
         if isinstance(stored, dict):
@@ -594,7 +648,12 @@ class QbAutoOrganizer(_PluginBase):
         if not self._processed_path.exists():
             self._write_json(self._processed_path, sorted(self._processed_hashes))
         if not self._records_path.exists():
-            self._write_json(self._records_path, [])
+            legacy_records_path = data_path / self._LEGACY_RECORDS_FILE
+            legacy_records = self._read_json(legacy_records_path, [])
+            self._write_json(
+                self._records_path,
+                legacy_records if isinstance(legacy_records, list) else [],
+            )
 
     def _load_records(self) -> List[dict]:
         with self._data_lock:
@@ -661,9 +720,17 @@ class QbAutoOrganizer(_PluginBase):
     @staticmethod
     def _is_completed(torrent: dict) -> bool:
         try:
-            return float(torrent.get("progress") or 0) >= 0.999999
+            progress_complete = float(torrent.get("progress") or 0) >= 0.999999
         except (TypeError, ValueError):
             return False
+        if not progress_complete:
+            return False
+
+        state = str(torrent.get("state") or "").strip().lower()
+        if not state:
+            # Older/custom qB-compatible APIs may omit state; progress remains usable.
+            return True
+        return state == "uploading" or state.endswith("up")
 
     @staticmethod
     def _torrent_content_path(torrent: dict) -> str:
@@ -937,6 +1004,33 @@ class QbAutoOrganizer(_PluginBase):
                                             },
                                         ],
                                     }
+                                ],
+                            },
+                            {
+                                "component": "VCardActions",
+                                "props": {"class": "px-4 pb-4"},
+                                "content": [
+                                    {
+                                        "component": "VBtn",
+                                        "props": {
+                                            "color": "error",
+                                            "variant": "tonal",
+                                            "prepend-icon": "mdi-database-refresh-outline",
+                                        },
+                                        "text": "重置基线",
+                                        "events": {
+                                            "click": {
+                                                "api": "plugin/QbAutoOrganizer/baseline/reset",
+                                                "method": "post",
+                                                "confirm": "确认删除固定基线？下次启动或配置重载会把当前全部种子作为历史种子。",
+                                            }
+                                        },
+                                    },
+                                    {
+                                        "component": "span",
+                                        "props": {"class": "text-caption text-medium-emphasis ml-3"},
+                                        "text": "删除后不会立即改变当前运行期；下次启动或重载时重新扫描。",
+                                    },
                                 ],
                             },
                         ],

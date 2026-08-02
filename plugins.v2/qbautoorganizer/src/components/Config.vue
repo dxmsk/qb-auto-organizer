@@ -13,6 +13,8 @@ const defaults = {
 }
 const config = ref({ ...defaults })
 const testing = ref(false)
+const resetDialog = ref(false)
+const resetting = ref(false)
 const snackbar = ref(false)
 const testSuccess = ref(false)
 const testMessage = ref('')
@@ -35,6 +37,23 @@ async function testConnection() {
     testMessage.value = err?.message || '连接测试失败'
   } finally {
     testing.value = false
+    snackbar.value = true
+  }
+}
+
+async function resetBaseline() {
+  resetting.value = true
+  try {
+    const response = await props.api.post('plugin/QbAutoOrganizer/baseline/reset', {})
+    const payload = response?.data?.success !== undefined ? response.data : response
+    testSuccess.value = Boolean(payload?.success)
+    testMessage.value = payload?.message || (testSuccess.value ? '基线已重置' : '重置基线失败')
+    if (testSuccess.value) resetDialog.value = false
+  } catch (err) {
+    testSuccess.value = false
+    testMessage.value = err?.message || '重置基线失败'
+  } finally {
+    resetting.value = false
     snackbar.value = true
   }
 }
@@ -85,6 +104,10 @@ onMounted(() => { config.value = { ...defaults, ...(props.initialConfig || {}) }
             />
           </VCol>
         </VRow>
+        <div class="d-flex flex-wrap align-center ga-3 mt-2">
+          <VBtn color="error" variant="tonal" prepend-icon="mdi-database-refresh-outline" @click="resetDialog = true">重置基线</VBtn>
+          <span class="text-caption text-medium-emphasis">下次插件启动或配置重载时重新扫描当前种子</span>
+        </div>
       </VCardText>
     </VCard>
 
@@ -96,9 +119,21 @@ onMounted(() => { config.value = { ...defaults, ...(props.initialConfig || {}) }
           <VCol cols="12" md="4"><VSelect v-model="config.log_level" :items="logLevels" label="日志级别" /></VCol>
           <VCol cols="12" md="4"><VSwitch v-model="config.enabled" label="启用插件" color="primary" inset /></VCol>
         </VRow>
-        <VAlert type="info" variant="tonal">启用时会把 qB 中所有现有种子作为启动基线，之后只整理新添加且下载完成的种子。</VAlert>
+        <VAlert type="info" variant="tonal">首次启用时会持久化 qB 中全部现有种子。后续重启沿用固定基线，只整理基线之外且下载完成的新种子。</VAlert>
       </VCardText>
     </VCard>
+
+    <VDialog v-model="resetDialog" max-width="520">
+      <VCard>
+        <VCardTitle class="d-flex align-center"><VIcon icon="mdi-alert-outline" color="error" class="mr-2" />确认重置基线</VCardTitle>
+        <VCardText>确认删除固定基线？当前运行不会立即改变；下次插件启动或配置重载时，qBittorrent 中所有现有种子都会重新记为历史种子。</VCardText>
+        <VCardActions>
+          <VSpacer />
+          <VBtn variant="text" :disabled="resetting" @click="resetDialog = false">取消</VBtn>
+          <VBtn color="error" variant="elevated" :loading="resetting" @click="resetBaseline">确认重置</VBtn>
+        </VCardActions>
+      </VCard>
+    </VDialog>
 
     <VSnackbar v-model="snackbar" :color="testSuccess ? 'success' : 'error'" timeout="5000">
       {{ testMessage }}

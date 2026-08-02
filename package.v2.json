@@ -3,13 +3,14 @@
     "name": "qB自动整理助手",
     "description": "监控 qBittorrent 下载完成，并立即触发 MoviePilot 媒体整理。",
     "labels": "下载管理,自动整理",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Qbittorrent_A.png",
     "author": "Codex",
     "level": 1,
     "v2": true,
     "system_version": ">=2.0.0",
     "history": {
+      "v1.3.0": "新增 baseline_hashes.json 固定基线，插件重启不再重建；新增配置页基线重置按钮，并将整理记录迁移至 transfer_records.json。",
       "v1.2.0": "增加强制整理开关；开启时传递 manual=True、force=True，并忽略“已整理”标签。",
       "v1.1.0": "仅处理插件启动后新增的种子；增加成功事件 JSON 记录、分页 API 与 Vue 状态页面。",
       "v1.0.0": "首个版本：qB Web API 轮询、标签过滤、持久化去重、MoviePilot 整理链和连接测试。"
