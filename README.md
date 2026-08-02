@@ -1,60 +1,59 @@
-# qB自动整理助手
+# qB 115 秒传
 
-这是一个 MoviePilot v2 插件。它首次启动时将 qBittorrent 中全部现有种子写入固定历史基线，之后只跟踪并整理基线之外新增且下载完成的任务。插件重启或修改配置时会继续加载原基线，不会把尚未完成的新种子误归为历史任务。
+适用于 MoviePilot V2 的 qBittorrent 下载完成秒传插件。
 
 ## 功能
 
-- 首次启动时持久化全部现有 hash，历史种子即使之后完成也不会触发整理；后续重启直接加载原基线。
-- 以 10 秒以上的自定义间隔轮询 qBittorrent，持续跟踪固定基线外新增但尚未完成的种子。
-- 支持逗号分隔的 qB 标签过滤；命中任意一个配置标签即处理，留空处理全部。
-- 支持“强制整理”开关。关闭时跳过带“已整理”标签或已有整理记录的任务；开启时向整理链传递 `manual=True, force=True`。
-- 使用插件数据目录中的 `processed_hashes.json` 持久化成功整理的 hash。
-- 通过 `TransferChain.do_transfer()` 传入下载路径、`download_hash` 与下载器来源。若存在 MoviePilot 下载历史，则沿用其中的具体下载器实例名；否则使用 `qbittorrent`。
-- 监听 MoviePilot `TransferComplete` 事件，只有实际整理成功后才写入 `transfer_records.json`。
-- 提供 Vue 状态页，展示海报、媒体名称、类型、整理时间和目标路径，每页 20 条。
-- 提供受 MoviePilot 鉴权保护的 `/records` 分页 API。
-- 日志级别支持 `DEBUG`、`INFO`、`WARNING`、`ERROR`。
-- 配置页提供“立即检测”按钮，测试登录、版本读取和已完成任务查询，并由 MoviePilot 弹窗显示结果。
-- 配置页提供带二次确认的“重置基线”按钮，对应受鉴权保护的 `/baseline/reset` API。
-- 不修改、暂停或删除 qBittorrent 中的种子。
+- 检测 qBittorrent 已完成任务，并通过本地秒传目录限制处理范围。
+- 只处理 qB 新进入“已完成”状态的种子，不会每轮重复读取历史完成种子的文件列表。
+- 复用 MoviePilot 已连接的 qB 客户端，以 1 秒间隔监控完成状态；完成哈希基线持久化到插件数据目录，避免重启后重复处理历史完成种子。
+- 可设置本地秒传目录；留空自动使用 MoviePilot 优先级最高的本地下载目录。
+- 只读计算文件 SHA1 和 115 二次验证所需的范围 SHA1。
+- 仅调用 115 秒传初始化；未命中秒传时不会执行普通上传。
+- 网络、Cookie 或协议错误按配置间隔持续重试。
+- MoviePilot 整理成功或失败后，停止对应秒传任务。
+- 秒传先成功时，在 MoviePilot 真正操作文件前拦截重复整理。
+- SQLite 持久化任务及文件状态，插件重启后继续处理。
+- 详情页显示已成功秒传的资源、成功时间、总大小、本地来源和 115 目标路径。
 
-## 目录结构
+## 要求
 
-```text
-qb-auto-organizer/
-├── package.v2.json
-└── plugins.v2/
-    └── qbautoorganizer/
-        ├── __init__.py
-        ├── dist/assets/remoteEntry.js
-        └── src/components/
-            ├── Config.vue
-            └── Page.vue
-```
+- MoviePilot `2.15.0` 或更高版本。
+- MoviePilot 已配置并启用 qBittorrent 下载器。
+- MoviePilot 容器能够访问 qBittorrent 的完成文件路径。
+- 有效的 115 Cookie，至少包含登录所需字段。
 
 ## 安装
 
-可将本目录作为 MoviePilot 自定义插件仓库发布，或把 `plugins.v2/qbautoorganizer` 放入对应的 MoviePilot 插件仓库后安装。插件 ID 为 `QbAutoOrganizer`。
+本压缩包使用标准 MoviePilot V2 插件仓库结构：
 
-安装后进入插件配置：
+```text
+package.v2.json
+plugins.v2/qb115rapidupload/
+```
 
-1. 填写 qBittorrent Web UI 地址、用户名和密码，保存配置。
-2. 点击“立即检测”，确认弹窗显示连接成功。
-3. 设置监控间隔、可选标签、强制整理开关和日志级别。
-4. 打开“启用插件”并保存。
+推荐把解压后的目录推送到自己的 Git 仓库，然后在 MoviePilot“插件市场设置”中添加该仓库地址，刷新市场后安装 **qB 115 秒传**。
 
-## 路径映射要求
+本地开发安装可把解压目录配置到 MoviePilot 的 `PLUGIN_LOCAL_REPO_PATHS`，然后刷新本地插件。
 
-qBittorrent API 返回的 `content_path` 必须能在 MoviePilot 容器内以同一路径访问。例如 qB 返回 `/downloads/movie/A.mkv`，MoviePilot 容器内也必须存在该路径。若两个容器使用了不同的内部路径，请调整 Docker volume，使两端路径一致。
+## 配置
 
-## 基线与去重
+- **启用插件**：默认开启。
+- **115 Cookie**：必填。
+- **秒传目录（本地）**：只处理该目录下的 qB 完成种子；留空使用 MoviePilot 默认本地下载目录，可用逗号分隔多个目录。
+- **目标目录 ID**：默认 `0`，即根目录。
+- **重试间隔（分钟）**：默认 30，范围 1-1440。
+- **整理后停止秒传**：默认开启。
+- **秒传成功后取消整理任务**：默认开启。
 
-首次成功连接 qBittorrent 时，当前全部种子 hash 会写入 `baseline_hashes.json` 并永久作为历史基线。以后启用、重启或修改配置均直接加载该文件；基线外的新种子即使尚未完成或期间插件重启，也会在后续轮询中继续等待。
+## 安全说明
 
-配置页的“重置基线”会删除基线文件，但不会改变当前运行实例的内存基线。下次插件启动或配置重载时，当前 qBittorrent 中全部种子会重新成为历史基线。
+插件的业务代码不会对下载目录执行写入、移动、重命名或删除。秒传失败也不会回退为普通文件上传。
 
-hash 只有在 MoviePilot 发出 `TransferComplete` 成功事件后才会写入 `processed_hashes.json`。路径暂不可见、识别失败或整理失败时不会记录，后续轮询会再次尝试。
+当前 MoviePilot 没有公开的整理队列删除 API，因此插件通过 `TransferIntercept` 在文件操作前阻止整理。MoviePilot 的整理历史可能显示一次带“115 秒传已成功”的失败/取消原因，这是预期行为。
 
-整理明细保存在 MoviePilot 插件数据目录的 `transfer_records.json` 中，记录接口按整理时间倒序返回。旧版 `organize_records.json` 会在首次升级时自动迁移。
+从 `0.1.x/0.2.x` 升级到 `0.3.x` 时，插件会取消旧版全量扫描自动生成的未完成积压任务，已经成功的记录会保留，并建立 qB 完成哈希基线。升级后只监控基线之外新进入完成状态的 qB 任务；MoviePilot 在下载开始时发送的任务会继续被持久化跟踪。
 
-标签匹配不区分大小写，并同时兼容英文逗号和中文逗号。
+本版本与 `dxmsk/qb-auto-organizer` 保持可选联动：自动整理插件提交整理前会读取本插件的只读任务状态；秒传处于等待、处理中或重试时，整理会短暂让路，秒传成功后自动跳过重复整理。秒传失败、源文件不存在、插件未安装或联动开关关闭时，自动整理仍按原逻辑工作。两插件不互相导入代码，任一插件均可单独启用。
+
+115 秒传接口并非稳定公开接口，本插件固定依赖 `p115client==0.0.9.6.4`。如果 115 调整协议，任务会保留并进入重试状态，不会改动本地文件。
