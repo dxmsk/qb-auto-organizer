@@ -1,36 +1,15 @@
 {
-  "Qb115RapidUpload": {
-    "name": "qB 115 秒传",
-    "description": "秒级监控 qBittorrent 新完成任务，只读计算 SHA1 并秒传至 115，支持重试及与 MoviePilot 整理队列协同",
-    "labels": "下载管理,115,秒传,qBittorrent",
-    "version": "0.4.1",
-    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/upload.png",
-    "author": "Codex",
-    "level": 1,
-    "v2": true,
-    "system_version": ">=2.15.0,<3",
-    "history": {
-      "v0.4.1": "调整联动时序：首次秒传失败后允许自动整理入队，后续重试成功时主动移除对应整理队列并由拦截器兜底",
-      "v0.4.0": "增加与 qB 自动整理助手的可选联动：秒传处理中优先等待，秒传成功后跳过重复整理；任一插件停用时仍可独立运行",
-      "v0.3.0": "融合 qB 自动整理助手的完成哈希基线与去重策略，改为复用 MoviePilot qB 客户端进行 1 秒级完成监控并立即触发秒传",
-      "v0.2.0": "改为只处理新进入完成状态的 qB 种子，增加本地秒传目录过滤、成功记录详情页和旧版全量扫描积压清理",
-      "v0.1.0": "首个版本：下载完成检测、只读 SHA1 秒传、失败重试、整理后放弃、秒传成功后拦截重复整理"
-    }
-  },
   "QbAutoOrganizer": {
     "name": "qB自动整理助手",
     "description": "监控 qBittorrent 下载完成，并立即触发 MoviePilot 媒体整理。",
     "labels": "下载管理,自动整理",
-    "version": "1.4.1",
+    "version": "1.2.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Qbittorrent_A.png",
     "author": "Codex",
     "level": 1,
     "v2": true,
     "system_version": ">=2.0.0",
     "history": {
-      "v1.4.1": "调整联动时序：首次秒传失败后允许自动整理入队，后续重试成功时主动移除对应整理队列并由拦截器兜底。",
-      "v1.4.0": "增加与 qB 115 秒传插件的可选联动：秒传处理中暂缓整理，秒传成功后持久化跳过整理；秒传失败或插件不可用时恢复原整理流程。",
-      "v1.3.0": "新增 baseline_hashes.json 固定基线，插件重启不再重建；新增配置页基线重置按钮，并将整理记录迁移至 transfer_records.json。",
       "v1.2.0": "增加强制整理开关；开启时传递 manual=True、force=True，并忽略“已整理”标签。",
       "v1.1.0": "仅处理插件启动后新增的种子；增加成功事件 JSON 记录、分页 API 与 Vue 状态页面。",
       "v1.0.0": "首个版本：qB Web API 轮询、标签过滤、持久化去重、MoviePilot 整理链和连接测试。"
